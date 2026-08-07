@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: wsbot
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: ALLOWED_USERS
+        sync: false
+      - key: ALLOWED_GROUPS
+        sync: false
+      - key: KEYWORDS
+        sync: false
+      - key: AUTO_REPLIES
+        sync: false
+      - key: DEBUG_MODE
+        sync: false
+      - key: CHROME_PATH
+        sync: false
+      - key: QR_TOKEN
+        sync: false
