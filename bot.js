@@ -83,7 +83,7 @@ const CHROME_PATH =
     process.env.CHROME_PATH ||
     (process.platform === 'win32'
         ? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
-        : '/usr/bin/chromium');
+        : '/usr/bin/google-chrome-stable');
 
 // ======================================
 // CLIENTE
@@ -104,7 +104,17 @@ const client = new Client({
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
-            '--disable-gpu'
+            '--disable-gpu',
+            '--single-process',
+            '--no-zygote',
+            '--disable-extensions',
+            '--disable-background-networking',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding',
+            '--no-first-run',
+            '--disable-component-update',
+            '--disable-default-apps'
 
         ]
     }

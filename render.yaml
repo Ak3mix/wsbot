@@ -16,6 +16,6 @@ services:
       - key: DEBUG_MODE
         sync: false
       - key: CHROME_PATH
-        sync: false
+        value: /usr/bin/google-chrome-stable
       - key: QR_TOKEN
         sync: false
