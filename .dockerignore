@@ -5,3 +5,4 @@ node_modules
 npm-debug.log*
 .wwebjs_auth
 .wwebjs_cache
+.baileys_auth

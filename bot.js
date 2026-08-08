@@ -4,9 +4,14 @@
 
 require('dotenv').config();
 
-const qrcode = require('qrcode-terminal');
+const pino = require('pino');
 
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const {
+    useMultiFileAuthState,
+    makeWASocket,
+    DisconnectReason,
+    fetchLatestBaileysVersion
+} = require('@whiskeysockets/baileys');
 
 // ======================================
 // HELPERS DE CONFIG
@@ -25,8 +30,9 @@ const splitCsv = (value) =>
 // CONFIG (variables de entorno)
 // ======================================
 
-// DEBUG (true/false)
-const DEBUG_MODE = toBool(process.env.DEBUG_MODE ?? 'true');
+// DEBUG (true/false). Detalle completo solo si es true;
+// los marcadores de una línea siempre se muestran.
+const DEBUG_MODE = toBool(process.env.DEBUG_MODE ?? 'false');
 
 // ======================================
 // GRUPOS AUTORIZADOS
@@ -39,10 +45,7 @@ const ALLOWED_GROUPS = splitCsv(process.env.ALLOWED_GROUPS);
 // USUARIOS AUTORIZADOS
 // ======================================
 
-// CSV. Acepta 3 formatos (con código de país):
-//   1) Número de teléfono          -> '521234567890'
-//   2) ID clásico                  -> '521234567890@c.us'
-//   3) ID LinkedIn (multi-device)  -> '2839174721783@lid'
+// CSV. Acepta número de teléfono, '@c.us' o '@lid'.
 // Vacío = TODOS los usuarios
 const ALLOWED_USERS = splitCsv(
     process.env.ALLOWED_USERS || '2839174721783@lid'
@@ -76,47 +79,11 @@ const AUTO_REPLIES = process.env.AUTO_REPLIES
         ];
 
 // ======================================
-// CHROME
+// SESIÓN (Baileys multi-file)
 // ======================================
 
-const CHROME_PATH =
-    process.env.CHROME_PATH ||
-    (process.platform === 'win32'
-        ? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
-        : '/usr/bin/google-chrome-stable');
-
-// ======================================
-// CLIENTE
-// ======================================
-
-const client = new Client({
-
-    authStrategy: new LocalAuth(),
-
-    puppeteer: {
-
-        headless: true,
-
-        executablePath: CHROME_PATH,
-
-        args: [
-
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--disable-extensions',
-            '--disable-background-networking',
-            '--disable-background-timer-throttling',
-            '--disable-backgrounding-occluded-windows',
-            '--disable-renderer-backgrounding',
-            '--no-first-run',
-            '--disable-component-update',
-            '--disable-default-apps'
-
-        ]
-    }
-});
+const SESSION_PATH =
+    process.env.SESSION_PATH || '.baileys_auth';
 
 // ======================================
 // NORMALIZACIÓN DE USUARIOS
@@ -127,7 +94,7 @@ const toDigits = (value) =>
     String(value || '')
         .replace(/\D+/g, '');
 
-// IDs completos (contienen '@'): @c.us y @lid
+// IDs completos (contienen '@'): @c.us / @s.whatsapp.net / @lid
 const allowedIds = new Set(
     ALLOWED_USERS
         .filter((u) => u.includes('@'))
@@ -142,59 +109,22 @@ const allowedNumbers = new Set(
 );
 
 // Resuelve si un remitente está autorizado,
-// normalizando LID / @c.us a número de teléfono.
-const isUserAllowed = async (msg) => {
+// normalizando LID / @s.whatsapp.net a número de teléfono.
+const isUserAllowed = (author) => {
 
-    const author = (msg.author || '')
+    const id = String(author || '')
         .toLowerCase()
         .trim();
 
-    // 1) Match directo con ID completo (@c.us / @lid)
-    if (allowedIds.has(author)) {
-        return { allowed: true, numbers: [] };
+    // 1) Match directo con ID completo
+    if (allowedIds.has(id)) {
+        return true;
     }
 
-    // 2) Resolver contacto -> número de teléfono
-    try {
-        const contact = await msg.getContact();
+    // 2) Match por dígitos (funciona con @s.whatsapp.net y @lid)
+    const digits = toDigits(id);
 
-        const candidates = [
-            toDigits(contact.number),
-            toDigits(
-                typeof contact.id === 'string'
-                    ? contact.id
-                    : contact.id?._serialized
-            )
-        ].filter(Boolean);
-
-        if (candidates.some((n) => allowedNumbers.has(n))) {
-            return { allowed: true, numbers: candidates };
-        }
-    } catch (e) {
-        // sin contacto en caché
-    }
-
-    // 3) Fallback: forzar resolución LID -> teléfono
-    try {
-        const result = await client.pupPage.evaluate(
-            (userId) => window.WWebJS.enforceLidAndPnRetrieval(userId),
-            msg.author || msg.from
-        );
-
-        if (result && result.phone) {
-            const digits = toDigits(
-                result.phone?._serialized || result.phone
-            );
-
-            if (allowedNumbers.has(digits)) {
-                return { allowed: true, numbers: [digits] };
-            }
-        }
-    } catch (e) {
-        // no se pudo resolver
-    }
-
-    return { allowed: false, numbers: [] };
+    return digits.length > 0 && allowedNumbers.has(digits);
 };
 
 // ======================================
@@ -232,281 +162,295 @@ const delay = (min, max) => {
 };
 
 // ======================================
-// QR (también capturado para el servidor web)
+// QR (capturado para el servidor web)
 // ======================================
 
 let latestQr = null;
 
-client.on('qr', qr => {
+const getQr = () => latestQr;
 
-    latestQr = qr;
+// ======================================
+// CLIENTE (Baileys)
+// ======================================
 
-    console.log('\n📱 ESCANEA QR:\n');
+let reconnecting = false;
 
-    qrcode.generate(qr, {
-        small: true
+const start = async () => {
+
+    const { state, saveCreds } =
+        await useMultiFileAuthState(SESSION_PATH);
+
+    const { version } =
+        await fetchLatestBaileysVersion();
+
+    const sock = makeWASocket({
+
+        version,
+
+        auth: state,
+
+        // Silencia el logger ruidoso de Baileys (pino)
+        logger: pino({ level: 'silent' }),
+
+        browser: ['WSbot', 'Chrome', '151'],
+
+        markOnlineOnConnect: false,
+
+        syncFullHistory: false,
+
+        // Evita prefetch de contactos/sesiones innecesarios
+        downloadHistory: false,
+
+        generateHighQualityLinkPreview: false
     });
-});
 
-// ======================================
-// LOADING / READY
-// ======================================
+    sock.ev.on('creds.update', saveCreds);
 
-client.on('loading_screen', (percent, message) => {
+    // ===============================
+    // CONNECTION
+    // ===============================
 
-    console.log(
-        `⏳ Cargando WhatsApp: ${percent}% ${message || ''}`
-    );
-});
+    sock.ev.on('connection.update', (update) => {
 
-client.on('ready', () => {
+        const { connection, lastDisconnect, qr } = update;
 
-    console.log('\n✅ BOT CONECTADO\n');
-});
+        if (qr) {
 
-// ======================================
-// RECONEXIÓN
-// ======================================
-
-const reconnect = async (attempt = 1) => {
-
-    const wait =
-        Math.min(1000 * 2 ** attempt, 60000);
-
-    console.log(
-        `🔄 Reintentando conexión en ${Math.round(wait / 1000)}s...`
-    );
-
-    await new Promise((resolve) =>
-        setTimeout(resolve, wait)
-    );
-
-    try {
-        await client.initialize();
-    } catch (err) {
-        console.log(
-            '❌ Error en initialize:',
-            err.message
-        );
-        await reconnect(attempt + 1);
-    }
-};
-
-client.on('disconnected', async (reason) => {
-
-    console.log(
-        `\n⚠️ DESCONECTADO: ${reason}\n`
-    );
-
-    await reconnect();
-});
-
-client.on('auth_failure', async (msg) => {
-
-    console.log(
-        `\n❌ FALLO DE AUTENTICACIÓN: ${msg}\n`
-    );
-
-    await reconnect();
-});
-
-// ======================================
-// MENSAJES
-// ======================================
-
-client.on('message_create', async (msg) => {
-
-    try {
-
-        // ===============================
-        // IGNORAR MENSAJES PROPIOS
-        // ===============================
-
-        if (msg.fromMe) return;
-
-        // ===============================
-        // CHAT
-        // ===============================
-
-        const chat =
-            await msg.getChat();
-
-        const isGroup =
-            chat.isGroup;
-
-        // ===============================
-        // SOLO GRUPOS
-        // ===============================
-
-        if (!isGroup) return;
-
-        // ===============================
-        // DATOS
-        // ===============================
-
-        const groupId =
-            (chat.id._serialized || '')
-                .trim();
-
-        const senderId =
-            (msg.author || '')
-                .trim();
-
-        const text =
-            (msg.body || '')
-                .toLowerCase()
-                .trim();
-
-        // ===============================
-        // DEBUG
-        // ===============================
-
-        if (DEBUG_MODE) {
-
-            console.log('\n========================');
-
-            console.log('📩 MENSAJE');
+            latestQr = qr;
 
             console.log(
-                'GRUPO:',
-                chat.name
-            );
-
-            console.log(
-                'GRUPO ID:',
-                groupId
-            );
-
-            console.log(
-                'USUARIO:',
-                senderId
-            );
-
-            console.log(
-                'MENSAJE:',
-                text
-            );
-
-            console.log('========================\n');
-        }
-
-        // ===============================
-        // FILTRO DE GRUPOS
-        // ===============================
-
-        const groupAllowed =
-
-            ALLOWED_GROUPS.length === 0 ||
-
-            ALLOWED_GROUPS.includes(
-                groupId
-            );
-
-        if (!groupAllowed) {
-
-            console.log(
-                '🚫 Grupo NO autorizado'
+                '\n📱 QR generado. Escanea en /qr (con QR_TOKEN)\n'
             );
 
             return;
         }
 
-        console.log(
-            '✅ Grupo autorizado'
-        );
+        if (connection === 'open') {
 
-        // ===============================
-        // FILTRO DE USUARIOS
-        // ===============================
-
-        // Vacío = TODOS los usuarios
-        if (ALLOWED_USERS.length === 0) {
+            latestQr = null;
 
             console.log(
-                '✅ Usuario autorizado (todos)'
+                '\n✅ BOT CONECTADO\n'
             );
 
-        } else {
+            return;
+        }
 
-            const result =
-                await isUserAllowed(msg);
+        if (connection === 'close') {
 
-            if (!result.allowed) {
+            const statusCode =
+                lastDisconnect?.error?.output?.statusCode;
+
+            const shouldReconnect =
+                statusCode !== DisconnectReason.loggedOut;
+
+            if (!shouldReconnect) {
 
                 console.log(
-                    '🚫 Usuario NO autorizado'
+                    '\n🚨 Sesión cerrada (loggedOut). Re-escanea el QR en /qr\n'
+                );
+
+                process.exit(0);
+            }
+
+            if (reconnecting) return;
+
+            reconnecting = true;
+
+            const attempt = (lastDisconnect?.error?.output?.statusCode
+                ? lastDisconnect.error.output.statusCode
+                : 0) || 1;
+
+            const wait =
+                Math.min(1000 * 2 ** attempt, 60000);
+
+            console.log(
+                `\n🔄 Reconectando en ${Math.round(wait / 1000)}s...\n`
+            );
+
+            setTimeout(() => {
+                reconnecting = false;
+                start().catch(() => process.exit(1));
+            }, wait);
+        }
+    });
+
+    // ===============================
+    // MENSAJES
+    // ===============================
+
+    sock.ev.on('messages.upsert', async ({ type, messages }) => {
+
+        // Solo mensajes nuevos (no history-sync)
+        if (type !== 'notify') return;
+
+        try {
+
+            const msg = messages[0];
+
+            if (!msg) return;
+
+            // ===============================
+            // IGNORAR MENSAJES PROPIOS
+            // ===============================
+
+            if (msg.key.fromMe) return;
+
+            // ===============================
+            // SOLO GRUPOS
+            // ===============================
+
+            const groupId =
+                String(msg.key.remoteJid || '');
+
+            if (!groupId.endsWith('@g.us')) return;
+
+            // ===============================
+            // DATOS
+            // ===============================
+
+            const senderId =
+                String(msg.key.participant || msg.key.remoteJid || '');
+
+            const text =
+                String(msg.message?.conversation ||
+                    msg.message?.extendedTextMessage?.text || '')
+                    .toLowerCase()
+                    .trim();
+
+            // ===============================
+            // DEBUG
+            // ===============================
+
+            if (DEBUG_MODE) {
+
+                console.log('\n========================');
+
+                console.log('📩 MENSAJE');
+
+                console.log('GRUPO ID:', groupId);
+
+                console.log('USUARIO:', senderId);
+
+                console.log('MENSAJE:', text);
+
+                console.log('========================\n');
+            }
+
+            // ===============================
+            // FILTRO DE GRUPOS
+            // ===============================
+
+            const groupAllowed =
+
+                ALLOWED_GROUPS.length === 0 ||
+
+                ALLOWED_GROUPS.includes(groupId);
+
+            if (!groupAllowed) {
+
+                console.log(
+                    '🚫 Grupo NO autorizado'
                 );
 
                 return;
             }
 
             console.log(
-                '✅ Usuario autorizado'
+                '✅ Grupo autorizado'
             );
 
-            if (
-                DEBUG_MODE &&
-                result.numbers.length
-            ) {
+            // ===============================
+            // FILTRO DE USUARIOS
+            // ===============================
+
+            // Vacío = TODOS los usuarios
+            if (ALLOWED_USERS.length === 0) {
 
                 console.log(
-                    'USUARIO NORMALIZADO:',
-                    result.numbers.join(' | ')
+                    '✅ Usuario autorizado (todos)'
+                );
+
+            } else {
+
+                if (!isUserAllowed(senderId)) {
+
+                    console.log(
+                        '🚫 Usuario NO autorizado'
+                    );
+
+                    return;
+                }
+
+                console.log(
+                    '✅ Usuario autorizado'
+                );
+
+                if (DEBUG_MODE) {
+
+                    console.log(
+                        'USUARIO NORMALIZADO:',
+                        toDigits(senderId)
+                    );
+                }
+            }
+
+            // ===============================
+            // PALABRAS CLAVE
+            // ===============================
+
+            const detected =
+                KEYWORDS.some(word =>
+                    text.includes(word)
+                );
+
+            if (!detected) return;
+
+            console.log(
+                '🚨 Keyword detectada'
+            );
+
+            // ===============================
+            // DELAY HUMANO (jitter)
+            // ===============================
+
+            await delay(1200, 2500);
+
+            // ===============================
+            // RESPUESTA VARIADA
+            // ===============================
+
+            const reply = pickReply();
+
+            if (DEBUG_MODE) {
+                console.log(
+                    'RESPUESTA ELEGIDA:',
+                    reply
                 );
             }
-        }
 
-        // ===============================
-        // PALABRAS CLAVE
-        // ===============================
-
-        const detected =
-            KEYWORDS.some(word =>
-                text.includes(word)
+            await sock.sendMessage(
+                groupId,
+                { text: reply },
+                { quoted: msg }
             );
 
-        if (!detected) return;
-
-        console.log(
-            '🚨 Keyword detectada'
-        );
-
-        // ===============================
-        // DELAY HUMANO (jitter)
-        // ===============================
-
-        await delay(1200, 2500);
-
-        // ===============================
-        // RESPUESTA VARIADA
-        // ===============================
-
-        const reply = pickReply();
-
-        if (DEBUG_MODE) {
             console.log(
-                'RESPUESTA ELEGIDA:',
-                reply
+                '✅ RESPUESTA ENVIADA'
             );
+
+        } catch (err) {
+
+            console.log(
+                '\n❌ ERROR\n'
+            );
+
+            console.log(err);
         }
+    });
 
-        await msg.reply(
-            reply
-        );
-
-        console.log(
-            '✅ RESPUESTA ENVIADA'
-        );
-
-    } catch (err) {
-
-        console.log(
-            '\n❌ ERROR\n'
-        );
-
-        console.log(err);
-    }
-});
+    return sock;
+};
 
 // ======================================
 // SERVIDOR WEB (health + QR)
@@ -515,37 +459,48 @@ client.on('message_create', async (msg) => {
 const startWebServer = require('./web');
 
 startWebServer({
-    getQr: () => latestQr
+    getQr
 });
 
 // ======================================
 // SHUTDOWN
 // ======================================
 
-process.on('SIGINT', async () => {
+let sockRef = null;
+
+const shutdown = async () => {
 
     console.log('\n🛑 Deteniendo bot...');
 
-    try {
-        await client.destroy();
-    } catch (e) {
-        // ignorar
+    if (sockRef) {
+        try {
+            await sockRef.end();
+        } catch (e) {
+            // ignorar
+        }
     }
 
     process.exit(0);
-});
+};
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
 
 // ======================================
 // START
 // ======================================
 
-client.initialize().catch((err) => {
+start()
+    .then((sock) => {
+        sockRef = sock;
+    })
+    .catch((err) => {
 
-    console.log(
-        '\n❌ ERROR AL INICIAR\n'
-    );
+        console.log(
+            '\n❌ ERROR AL INICIAR\n'
+        );
 
-    console.log(err);
+        console.log(err);
 
-    process.exit(1);
-});
+        process.exit(1);
+    });
