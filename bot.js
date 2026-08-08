@@ -105,8 +105,6 @@ const client = new Client({
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
             '--disable-gpu',
-            '--single-process',
-            '--no-zygote',
             '--disable-extensions',
             '--disable-background-networking',
             '--disable-background-timer-throttling',
