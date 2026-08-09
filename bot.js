@@ -4,6 +4,8 @@
 
 require('dotenv').config();
 
+const util = require('util');
+
 const pino = require('pino');
 
 const {
@@ -170,6 +172,74 @@ let latestQr = null;
 const getQr = () => latestQr;
 
 // ======================================
+// ESTADO DE DIAGNÓSTICO (para /debug)
+// ======================================
+
+let lastStatus = null;
+
+let lastQrAt = null;
+
+let lastCloseAt = null;
+
+let lastCloseError = null;
+
+let currentRegistered = false;
+
+const bootAt = Date.now();
+
+// Formatea el error de desconexión para /debug sin datos sensibles
+const formatCloseError = (err) => {
+
+    if (!err) return null;
+
+    const statusCode =
+        err.output?.statusCode;
+
+    return {
+        statusCode:
+            statusCode ?? null,
+        message:
+            err.message || String(err),
+        output_payload:
+            err.output?.payload ||
+            undefined
+    };
+};
+
+const getDebug = () => ({
+
+    uptimeSec:
+        Math.round(process.uptime()),
+
+    bootAt:
+        new Date(bootAt).toISOString(),
+
+    connected:
+        lastStatus === 'open',
+
+    lastStatus,
+
+    lastQrAt,
+
+    lastCloseAt,
+
+    lastCloseError,
+
+    sessionRegistered:
+        currentRegistered,
+
+    sessionPath: SESSION_PATH,
+
+    debugMode: DEBUG_MODE,
+
+    node:
+
+        process.version,
+
+    port: process.env.PORT || 7860
+});
+
+// ======================================
 // CLIENTE (Baileys)
 // ======================================
 
@@ -191,8 +261,9 @@ const start = async () => {
 
         auth: state,
 
-        // Silencia el logger ruidoso de Baileys (pino)
-        logger: pino({ level: 'silent' }),
+        // Logger de Baileys: 'error' por defecto (captura causas reales
+        // sin spam); 'info' con detalle si DEBUG_MODE=true
+        logger: pino({ level: DEBUG_MODE ? 'info' : 'error' }),
 
         browser: ['WSbot', 'Chrome', '151'],
 
@@ -206,7 +277,19 @@ const start = async () => {
         generateHighQualityLinkPreview: false
     });
 
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', (creds) => {
+
+        saveCreds(creds);
+
+        if (creds.registered !== undefined) {
+            currentRegistered = creds.registered === true;
+            console.log('[sock] sesión registrada =', currentRegistered);
+        }
+    });
+
+    console.log(
+        `\n[Boot] Baileys OK | WA version ${version} | sesión registrada: ${state.creds.registered === true}\n`
+    );
 
     // ===============================
     // CONNECTION
@@ -216,9 +299,19 @@ const start = async () => {
 
         const { connection, lastDisconnect, qr } = update;
 
+        lastStatus = connection || 'connecting';
+
         if (qr) {
 
             latestQr = qr;
+
+            lastQrAt = Date.now();
+
+            if (DEBUG_MODE) {
+                console.log(
+                    '[sock] evento: QR recibido'
+                );
+            }
 
             console.log(
                 '\n📱 QR generado. Escanea en /qr (con QR_TOKEN)\n'
@@ -248,12 +341,52 @@ const start = async () => {
             const isLoggedOut =
                 statusCode === DisconnectReason.loggedOut;
 
-            latestQr = null;
+            // En timeouts/errores de red (408), el QR pendiente sigue
+            // vinculado a esta sesión: NO borrarlo para que el escaneo
+            // pueda completarse cuando el ws se re-establezca.
+            if (isLoggedOut) {
+                latestQr = null;
+            }
+
+            lastCloseAt = Date.now();
+
+            lastCloseError =
+                formatCloseError(lastDisconnect?.error);
+
+            console.log(
+                '\n🛑 CONEXIÓN CERRADA'
+            );
+
+            console.log(
+                'statusCode =',
+                statusCode
+            );
+
+            console.log(
+                'isLoggedOut =',
+                isLoggedOut
+            );
+
+            // Causa real que reporta Baileys (no ocultamos nada)
+            console.error(
+                '\n--- DETALLE ERROR ---'
+            );
+
+            console.error(
+                util.inspect(
+                    lastDisconnect?.error || {},
+                    { depth: 4, colors: false }
+                )
+            );
+
+            console.error(
+                '--- FIN DETALLE ---\n'
+            );
 
             if (isLoggedOut) {
 
                 console.log(
-                    '\n🚨 Sesión cerrada (loggedOut). Re-escanea el QR en /qr\n'
+                    '\n🚨 Sesión cerrada (loggedOut). Re-escanea el QR en /qr (o quita dispositivos viejos)\n'
                 );
 
             } else {
@@ -486,7 +619,8 @@ const start = async () => {
 const startWebServer = require('./web');
 
 startWebServer({
-    getQr
+    getQr,
+    getDebug
 });
 
 // ======================================

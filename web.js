@@ -7,7 +7,7 @@ const qrcode = require('qrcode');
 
 module.exports = function startWebServer(options) {
 
-    const { getQr } = options;
+    const { getQr, getDebug } = options;
 
     const app = express();
 
@@ -55,6 +55,27 @@ module.exports = function startWebServer(options) {
 </body>
 </html>`
         );
+    });
+
+    // ===============================
+    // DEBUG (estado + último error de conexión)
+    // ===============================
+
+    app.get('/debug', (req, res) => {
+
+        if (token && req.query.token !== token) {
+            return res.status(403).send('No autorizado');
+        }
+
+        const debug =
+            typeof getDebug === 'function'
+                ? getDebug()
+                : {};
+
+        res.json({
+            web: 'ok',
+            ...debug
+        });
     });
 
     app.listen(port, () => {
