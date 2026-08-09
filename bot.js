@@ -175,6 +175,8 @@ const getQr = () => latestQr;
 
 let reconnecting = false;
 
+let reconnectAttempt = 0;
+
 const start = async () => {
 
     const { state, saveCreds } =
@@ -229,6 +231,8 @@ const start = async () => {
 
             latestQr = null;
 
+            reconnectAttempt = 0;
+
             console.log(
                 '\n✅ BOT CONECTADO\n'
             );
@@ -241,36 +245,59 @@ const start = async () => {
             const statusCode =
                 lastDisconnect?.error?.output?.statusCode;
 
-            const shouldReconnect =
-                statusCode !== DisconnectReason.loggedOut;
+            const isLoggedOut =
+                statusCode === DisconnectReason.loggedOut;
 
-            if (!shouldReconnect) {
+            latestQr = null;
+
+            if (isLoggedOut) {
 
                 console.log(
                     '\n🚨 Sesión cerrada (loggedOut). Re-escanea el QR en /qr\n'
                 );
 
-                process.exit(0);
+            } else {
+
+                console.log(
+                    '\n⚠️ Conexión cerrada. Reconectando...\n'
+                );
             }
 
             if (reconnecting) return;
 
             reconnecting = true;
 
-            const attempt = (lastDisconnect?.error?.output?.statusCode
-                ? lastDisconnect.error.output.statusCode
-                : 0) || 1;
+            // Backoff capado (se reinicia al lograr conexión)
+            const attempt =
+                reconnectAttempt > 0
+                    ? reconnectAttempt
+                    : 1;
 
             const wait =
-                Math.min(1000 * 2 ** attempt, 60000);
+                Math.min(5000 * 2 ** (attempt - 1), 60000);
+
+            reconnectAttempt += 1;
 
             console.log(
-                `\n🔄 Reconectando en ${Math.round(wait / 1000)}s...\n`
+                `🔄 Reconectando en ${Math.round(wait / 1000)}s...`
             );
 
             setTimeout(() => {
+
                 reconnecting = false;
-                start().catch(() => process.exit(1));
+
+                start()
+                    .then((sock) => {
+                        sockRef = sock;
+                    })
+                    .catch((err) => {
+
+                        console.log(
+                            '\n❌ Error al reconectar\n'
+                        );
+
+                        console.log(err);
+                    });
             }, wait);
         }
     });
@@ -490,11 +517,13 @@ process.on('SIGTERM', shutdown);
 // START
 // ======================================
 
-start()
-    .then((sock) => {
-        sockRef = sock;
-    })
-    .catch((err) => {
+const boot = async () => {
+
+    try {
+
+        sockRef = await start();
+
+    } catch (err) {
 
         console.log(
             '\n❌ ERROR AL INICIAR\n'
@@ -502,5 +531,9 @@ start()
 
         console.log(err);
 
-        process.exit(1);
-    });
+        // Reintentar sin matar la instancia
+        setTimeout(boot, 5000);
+    }
+};
+
+boot();
