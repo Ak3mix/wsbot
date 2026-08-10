@@ -110,23 +110,99 @@ const allowedNumbers = new Set(
         .filter(Boolean)
 );
 
-// Resuelve si un remitente está autorizado,
-// normalizando LID / @s.whatsapp.net a número de teléfono.
+// Mapa LID -> número de teléfono (Baileys entrega remitentes como
+// @lid; el número real llega via 'contacts.update').
+const lidPns = new Map();
+
+// Resuelve si un remitente está autorizado, soportando:
+//   '521234567890@c.us' (formato usado en ALLOWED_USERS),
+//   '521234567890@s.whatsapp.net' y LID '2839174721783@lid'.
 const isUserAllowed = (author) => {
 
     const id = String(author || '')
         .toLowerCase()
         .trim();
 
-    // 1) Match directo con ID completo
+    if (!id) return false;
+
+    // 1) Match directo con ID completo (@c.us / @s.whatsapp.net / @lid)
     if (allowedIds.has(id)) {
         return true;
     }
 
-    // 2) Match por dígitos (funciona con @s.whatsapp.net y @lid)
-    const digits = toDigits(id);
+    const candidates = [];
 
-    return digits.length > 0 && allowedNumbers.has(digits);
+    // 2) Si es LID, resolver primero a número de teléfono real
+    if (id.endsWith('@lid')) {
+
+        const pn = lidPns.get(id);
+
+        if (pn) {
+            candidates.push(String(pn).toLowerCase().trim());
+        }
+    }
+
+    // 3) El propio ID (los dígitos funcionan para @c.us / @s.whatsapp.net)
+    candidates.push(id);
+
+    const matches = candidates
+
+        .map(toDigits)
+
+        .filter(Boolean)
+
+        .filter((n) => allowedNumbers.has(n));
+
+    return matches.length > 0;
+};
+
+// Devuelve el número real (si el remitente es LID) para logs/diagnóstico
+const lidToPhone = (author) => {
+
+    const id = String(author || '')
+        .toLowerCase()
+        .trim();
+
+    return id.endsWith('@lid') ? lidPns.get(id) : null;
+};
+
+// Resuelve LID -> número real usando los metadatos del grupo
+// (caché de 2 min por grupo, para no spamear a WhatsApp).
+const groupLidCache = new Map();
+
+const ensureGroupLidMap = async (sock, groupId) => {
+
+    const last = groupLidCache.get(groupId) || 0;
+
+    if (Date.now() - last < 120000) return;
+
+    try {
+
+        const meta = await sock.groupMetadata(groupId);
+
+        for (const p of meta?.participants || []) {
+
+            if (!p.lid) continue;
+
+            // 'jid' es el PN-jid; 'id' puede ser el mismo PN o el LID
+            const resolvedJid = p.jid || p.id || '';
+
+            if (resolvedJid) {
+
+                lidPns.set(
+                    String(p.lid).toLowerCase().trim(),
+                    String(resolvedJid).trim()
+                );
+            }
+        }
+
+        groupLidCache.set(groupId, Date.now());
+
+    } catch (e) {
+
+        // sin permiso o error de red: reintentar en ~1 min
+        groupLidCache.set(groupId, Date.now() - 115000);
+    }
 };
 
 // ======================================
@@ -285,6 +361,37 @@ const start = async () => {
             currentRegistered = creds.registered === true;
             console.log('[sock] sesión registrada =', currentRegistered);
         }
+    });
+
+    // Baileys entrega remitentes de grupo como LID. El número real
+    // se aprende de: contacts.upsert/update, chats.phoneNumberShare
+    // y (garantizado) de groupMetadata(). Lo guardamos en el mapa LID->PN.
+    const setLid = (lid, jid) => {
+
+        if (!lid || !jid) return;
+
+        lidPns.set(
+            String(lid).toLowerCase().trim(),
+            String(jid).trim()
+        );
+    };
+
+    sock.ev.on('contacts.update', (contacts) => {
+
+        for (const c of contacts || []) {
+            if (c.lid) setLid(c.lid, c.jid || c.id);
+        }
+    });
+
+    sock.ev.on('contacts.upsert', (contacts) => {
+
+        for (const c of contacts || []) {
+            if (c.lid) setLid(c.lid, c.jid || c.id);
+        }
+    });
+
+    sock.ev.on('chats.phoneNumberShare', ({ lid, jid }) => {
+        setLid(lid, jid);
     });
 
     console.log(
@@ -465,6 +572,10 @@ const start = async () => {
 
             if (!groupId.endsWith('@g.us')) return;
 
+            // Aprende el mapa LID -> número de los miembros del grupo
+            // (necesario para autorizar remitentes entregados como @lid)
+            await ensureGroupLidMap(sock, groupId);
+
             // ===============================
             // DATOS
             // ===============================
@@ -548,9 +659,16 @@ const start = async () => {
 
                 if (DEBUG_MODE) {
 
+                    const resolved =
+
+                        lidToPhone(senderId);
+
                     console.log(
                         'USUARIO NORMALIZADO:',
-                        toDigits(senderId)
+                        toDigits(senderId),
+                        resolved
+                            ? `| LID -> PN: ${resolved}`
+                            : ''
                     );
                 }
             }
