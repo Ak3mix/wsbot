@@ -16,6 +16,69 @@ const {
 } = require('@whiskeysockets/baileys');
 
 // ======================================
+// CAPTURA DE LOGS (para el endpoint /logs)
+// ======================================
+
+const logHistory = [];
+
+const LOG_HISTORY_MAX = 500;
+
+let pendingLine = '';
+
+const nowStamp = () => {
+
+    const d = new Date();
+
+    const p = (n) => String(n).padStart(2, '0');
+
+    return `[${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}]`;
+};
+
+const pushLogLine = (line) => {
+
+    logHistory.push(line);
+
+    if (logHistory.length > LOG_HISTORY_MAX) {
+        logHistory.splice(0, logHistory.length - LOG_HISTORY_MAX);
+    }
+};
+
+const captureStream = (stream) => {
+
+    const orig = stream.write.bind(stream);
+
+    stream.write = (chunk, encoding, cb) => {
+
+        const text =
+            Buffer.isBuffer(chunk)
+                ? chunk.toString('utf8')
+                : String(chunk);
+
+        const lines = (pendingLine + text).split('\n');
+
+        pendingLine = lines.pop() || '';
+
+        for (const l of lines) {
+            pushLogLine(`${nowStamp()} ${l}`);
+        }
+
+        return orig(chunk, encoding, cb);
+    };
+};
+
+captureStream(process.stdout);
+captureStream(process.stderr);
+
+const getLogs = (n) => {
+
+    const lines = logHistory.slice(-n);
+
+    if (pendingLine) lines.push(`${nowStamp()} ${pendingLine}`);
+
+    return lines.join('\n');
+};
+
+// ======================================
 // HELPERS DE CONFIG
 // ======================================
 
@@ -35,6 +98,20 @@ const splitCsv = (value) =>
 // DEBUG (true/false). Detalle completo solo si es true;
 // los marcadores de una línea siempre se muestran.
 const DEBUG_MODE = toBool(process.env.DEBUG_MODE ?? 'false');
+
+// ======================================
+// DELAY DE RESPUESTA (ms). 0 = instantáneo
+// ======================================
+
+const REPLY_DELAY_MIN = Math.max(
+    0,
+    parseInt(process.env.REPLY_DELAY_MIN || '0', 10) || 0
+);
+
+const REPLY_DELAY_MAX = Math.max(
+    0,
+    parseInt(process.env.REPLY_DELAY_MAX || '0', 10) || 0
+);
 
 // ======================================
 // GRUPOS AUTORIZADOS
@@ -226,13 +303,16 @@ const pickReply = () => {
 };
 
 // ======================================
-// DELAY HUMANO (jitter 1.2s - 2.5s)
+// DELAY (jitter configurable; default 0 = sin espera)
 // ======================================
 
 const delay = (min, max) => {
 
-    const ms =
-        min + Math.random() * (max - min);
+    const lo = Math.min(min, max);
+
+    const hi = Math.max(min, max);
+
+    const ms = lo + Math.random() * (hi - lo);
 
     return new Promise((resolve) =>
         setTimeout(resolve, ms)
@@ -557,6 +637,8 @@ const start = async () => {
 
             if (!msg) return;
 
+            const receivedAt = Date.now();
+
             // ===============================
             // IGNORAR MENSAJES PROPIOS
             // ===============================
@@ -571,10 +653,6 @@ const start = async () => {
                 String(msg.key.remoteJid || '');
 
             if (!groupId.endsWith('@g.us')) return;
-
-            // Aprende el mapa LID -> número de los miembros del grupo
-            // (necesario para autorizar remitentes entregados como @lid)
-            await ensureGroupLidMap(sock, groupId);
 
             // ===============================
             // DATOS
@@ -635,6 +713,14 @@ const start = async () => {
             // FILTRO DE USUARIOS
             // ===============================
 
+            // Resolver LID -> número solo si el remitente es @lid y
+            // todavía no conocemos su número real (fuera de la ruta caliente)
+            const lid = senderId.toLowerCase().trim();
+
+            if (lid.endsWith('@lid') && !lidPns.has(lid)) {
+                await ensureGroupLidMap(sock, groupId);
+            }
+
             // Vacío = TODOS los usuarios
             if (ALLOWED_USERS.length === 0) {
 
@@ -689,10 +775,16 @@ const start = async () => {
             );
 
             // ===============================
-            // DELAY HUMANO (jitter)
+            // DELAY DE RESPUESTA (0 por defecto = instantáneo)
             // ===============================
 
-            await delay(1200, 2500);
+            if (REPLY_DELAY_MAX > 0) {
+
+                await delay(
+                    REPLY_DELAY_MIN,
+                    REPLY_DELAY_MAX
+                );
+            }
 
             // ===============================
             // RESPUESTA VARIADA
@@ -717,6 +809,12 @@ const start = async () => {
                 '✅ RESPUESTA ENVIADA'
             );
 
+            if (DEBUG_MODE) {
+                console.log(
+                    `⏱️ Latencia recepción→respuesta: ${Date.now() - receivedAt}ms`
+                );
+            }
+
         } catch (err) {
 
             console.log(
@@ -738,7 +836,8 @@ const startWebServer = require('./web');
 
 startWebServer({
     getQr,
-    getDebug
+    getDebug,
+    getLogs
 });
 
 // ======================================

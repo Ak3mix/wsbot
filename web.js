@@ -7,7 +7,7 @@ const qrcode = require('qrcode');
 
 module.exports = function startWebServer(options) {
 
-    const { getQr, getDebug } = options;
+    const { getQr, getDebug, getLogs } = options;
 
     const app = express();
 
@@ -16,6 +16,12 @@ module.exports = function startWebServer(options) {
 
     const token =
         process.env.QR_TOKEN || '';
+
+    const restartToken =
+        process.env.RESTART_TOKEN || token || '';
+
+    const logsToken =
+        process.env.LOGS_TOKEN || token || '';
 
     // ===============================
     // HEALTH (target del keep-alive y de Render)
@@ -78,9 +84,64 @@ module.exports = function startWebServer(options) {
         });
     });
 
+    // ===============================
+    // RESTART (reinicio total -> Render crea instancia nueva -> re-escaneo)
+    // ===============================
+
+    app.all('/restart', (req, res) => {
+
+        const t =
+            req.query.token ||
+            req.headers['x-restart-token'] ||
+            '';
+
+        if (restartToken && t !== restartToken) {
+            return res.status(403).send('No autorizado');
+        }
+
+        console.log('♻️ Reinicio total solicitado');
+
+        res.status(202).send(
+            'Reiniciando bot. Re-escanea el QR en /qr'
+        );
+
+        setTimeout(() => process.exit(0), 300);
+    });
+
+    // ===============================
+    // LOGS (últimas líneas de stdout/stderr)
+    // ===============================
+
+    app.get('/logs', (req, res) => {
+
+        const t =
+            req.query.token ||
+            req.headers['x-logs-token'] ||
+            '';
+
+        if (logsToken && t !== logsToken) {
+            return res.status(403).send('No autorizado');
+        }
+
+        const n = Math.min(
+            parseInt(req.query.lines || '200', 10) || 200,
+            1000
+        );
+
+        const out =
+            typeof getLogs === 'function'
+                ? getLogs(n)
+                : '';
+
+        res
+            .type('text/plain; charset=utf-8')
+            .set('Cache-Control', 'no-store')
+            .send(out);
+    });
+
     app.listen(port, () => {
         console.log(
-            `🌐 Web server en puerto ${port} (/health, /qr)`
+            `🌐 Web server en puerto ${port} (/health, /qr, /debug, /logs, /restart)`
         );
     });
 };

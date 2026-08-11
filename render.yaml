@@ -17,3 +17,11 @@ services:
         sync: false
       - key: QR_TOKEN
         sync: false
+      - key: RESTART_TOKEN
+        sync: false
+      - key: LOGS_TOKEN
+        sync: false
+      - key: REPLY_DELAY_MIN
+        sync: false
+      - key: REPLY_DELAY_MAX
+        sync: false
