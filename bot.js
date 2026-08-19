@@ -6,6 +6,8 @@ require('dotenv').config();
 
 const util = require('util');
 
+const fs = require('fs');
+
 const pino = require('pino');
 
 const {
@@ -112,6 +114,67 @@ const REPLY_DELAY_MAX = Math.max(
     0,
     parseInt(process.env.REPLY_DELAY_MAX || '0', 10) || 0
 );
+
+// ======================================
+// NOTIFICACIONES (ntfy, con antispam)
+// ======================================
+
+const NOTIFY_URL = process.env.NOTIFY_URL || '';
+
+// Avisar cuando el bot responde (solo nombre del grupo)
+const NOTIFY_REPLY = toBool(process.env.NOTIFY_REPLY ?? 'false');
+
+// Recordatorio de QR sin escanear: 1ª vez inmediato, luego cada 5h
+const QR_NOTIFY_INTERVAL = 5 * 60 * 60 * 1000;
+
+// Reconexión: avisar tras 5 fallos seguidos, luego 1 vez por hora
+const RECONNECT_NOTIFY_AFTER = 5;
+
+const RECONNECT_NOTIFY_INTERVAL = 60 * 60 * 1000;
+
+let reconnectFailCount = 0;
+
+const lastNotifyAt = {};
+
+const notify = (title, body, opts = {}) => {
+
+    if (!NOTIFY_URL) return;
+
+    const { priority = 'default', tags = '' } = opts;
+
+    const controller = new AbortController();
+
+    const timer = setTimeout(() => controller.abort(), 3000);
+
+    fetch(NOTIFY_URL, {
+        method: 'POST',
+        headers: {
+            Title: title,
+            Priority: priority,
+            Tags: tags
+        },
+        body,
+        signal: controller.signal
+    })
+        .catch(() => { /* sin red: ignorar */ })
+        .finally(() => clearTimeout(timer));
+};
+
+// Notifica respetando cooldown por clave (antispam)
+const notifyCooldown = (key, intervalMs, title, body, opts) => {
+
+    const last = lastNotifyAt[key] || 0;
+
+    if (Date.now() - last < intervalMs) return;
+
+    lastNotifyAt[key] = Date.now();
+
+    notify(title, body, opts);
+};
+
+const notifyReset = (key) => {
+    delete lastNotifyAt[key];
+};
 
 // ======================================
 // GRUPOS AUTORIZADOS
@@ -257,6 +320,10 @@ const ensureGroupLidMap = async (sock, groupId) => {
 
         const meta = await sock.groupMetadata(groupId);
 
+        if (meta?.subject) {
+            groupNames.set(groupId, { name: meta.subject, ts: Date.now() });
+        }
+
         for (const p of meta?.participants || []) {
 
             if (!p.lid) continue;
@@ -279,6 +346,35 @@ const ensureGroupLidMap = async (sock, groupId) => {
 
         // sin permiso o error de red: reintentar en ~1 min
         groupLidCache.set(groupId, Date.now() - 115000);
+    }
+};
+
+// Caché de nombres de grupo (groupId -> { name, ts }), TTL 1h
+const groupNames = new Map();
+
+const GROUP_NAME_TTL = 60 * 60 * 1000;
+
+const getGroupName = async (sock, groupId) => {
+
+    const cached = groupNames.get(groupId);
+
+    if (cached && Date.now() - cached.ts < GROUP_NAME_TTL) {
+        return cached.name;
+    }
+
+    try {
+
+        const meta = await sock.groupMetadata(groupId);
+
+        const name = meta?.subject || groupId;
+
+        groupNames.set(groupId, { name, ts: Date.now() });
+
+        return name;
+
+    } catch (e) {
+
+        return groupId;
     }
 };
 
@@ -403,6 +499,8 @@ let reconnecting = false;
 
 let reconnectAttempt = 0;
 
+let reconnectTimer = null;
+
 const start = async () => {
 
     const { state, saveCreds } =
@@ -513,6 +611,12 @@ const start = async () => {
 
             reconnectAttempt = 0;
 
+            reconnectFailCount = 0;
+
+            notifyReset('session');
+
+            notifyReset('reconnect');
+
             console.log(
                 '\n✅ BOT CONECTADO\n'
             );
@@ -585,6 +689,34 @@ const start = async () => {
 
             if (reconnecting) return;
 
+            // Notificación de sesión/QR (1ª vez inmediato, luego cada 5h)
+            if (!currentRegistered || isLoggedOut) {
+
+                notifyCooldown(
+                    'session',
+                    QR_NOTIFY_INTERVAL,
+                    !currentRegistered
+                        ? '🚨 Bot sin escanear'
+                        : '🚨 Sesión cerrada (logout)',
+                    'Re-escanea el QR en /qr cuando quieras.',
+                    { priority: 'high', tags: 'warning' }
+                );
+            }
+
+            // Reconexión fallando: tras N fallos, luego 1 vez por hora
+            reconnectFailCount += 1;
+
+            if (reconnectFailCount >= RECONNECT_NOTIFY_AFTER) {
+
+                notifyCooldown(
+                    'reconnect',
+                    RECONNECT_NOTIFY_INTERVAL,
+                    '⚠️ Reconexión fallando',
+                    `${reconnectFailCount} intentos de reconexión sin éxito.`,
+                    { tags: 'warning' }
+                );
+            }
+
             reconnecting = true;
 
             // Backoff capado (se reinicia al lograr conexión)
@@ -602,7 +734,7 @@ const start = async () => {
                 `🔄 Reconectando en ${Math.round(wait / 1000)}s...`
             );
 
-            setTimeout(() => {
+            reconnectTimer = setTimeout(() => {
 
                 reconnecting = false;
 
@@ -809,6 +941,17 @@ const start = async () => {
                 '✅ RESPUESTA ENVIADA'
             );
 
+            if (NOTIFY_REPLY) {
+
+                const groupName = await getGroupName(sock, groupId);
+
+                notify(
+                    '📨 Bot respondió',
+                    `Respondí en "${groupName}".`,
+                    { tags: 'speech_balloon' }
+                );
+            }
+
             if (DEBUG_MODE) {
                 console.log(
                     `⏱️ Latencia recepción→respuesta: ${Date.now() - receivedAt}ms`
@@ -834,12 +977,6 @@ const start = async () => {
 
 const startWebServer = require('./web');
 
-startWebServer({
-    getQr,
-    getDebug,
-    getLogs
-});
-
 // ======================================
 // SHUTDOWN
 // ======================================
@@ -850,6 +987,11 @@ const shutdown = async () => {
 
     console.log('\n🛑 Deteniendo bot...');
 
+    notify(
+        '🛑 Bot detenido',
+        'El proceso se detuvo (SIGTERM/SIGINT): hibernación, deploy o reinicio de Render.'
+    );
+
     if (sockRef) {
         try {
             await sockRef.end();
@@ -858,11 +1000,73 @@ const shutdown = async () => {
         }
     }
 
+    // Dar tiempo a que salga el POST de notificación
+    await delay(1500, 1500);
+
     process.exit(0);
 };
 
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+
+// ======================================
+// REINICIO EN-PROCESO (sin matar la instancia)
+// ======================================
+
+const restartBot = async () => {
+
+    console.log('\n♻️ Reiniciando bot (sesión nueva)...\n');
+
+    notify(
+        '♻️ Reinicio solicitado',
+        'El bot se reinició y la sesión se borró. Re-escanea el QR en /qr cuando quieras.'
+    );
+
+    reconnecting = true;
+
+    // Cancelar cualquier reconexión pendiente: /restart gana siempre
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+
+    if (sockRef) {
+        try {
+            await sockRef.end();
+        } catch (e) {
+            // ignorar
+        }
+        sockRef = null;
+    }
+
+    // Esperar a que el ws cierre del todo
+    await delay(1000, 1000);
+
+    // Sesión nueva: borrar credenciales para forzar re-escaneo
+    try {
+
+        fs.rmSync(SESSION_PATH, { recursive: true, force: true });
+
+        console.log('[restart] sesión eliminada:', SESSION_PATH);
+
+    } catch (e) {
+
+        console.log('[restart] no se pudo borrar la sesión:', e.message);
+    }
+
+    latestQr = null;
+    reconnectAttempt = 0;
+    reconnectFailCount = 0;
+    lidPns.clear();
+    groupLidCache.clear();
+    groupNames.clear();
+    notifyReset('session');
+    notifyReset('reconnect');
+
+    reconnecting = false;
+
+    await boot();
+};
 
 // ======================================
 // START
@@ -886,5 +1090,12 @@ const boot = async () => {
         setTimeout(boot, 5000);
     }
 };
+
+startWebServer({
+    getQr,
+    getDebug,
+    getLogs,
+    getRestart: restartBot
+});
 
 boot();

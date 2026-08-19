@@ -25,3 +25,7 @@ services:
         sync: false
       - key: REPLY_DELAY_MAX
         sync: false
+      - key: NOTIFY_URL
+        sync: false
+      - key: NOTIFY_REPLY
+        sync: false

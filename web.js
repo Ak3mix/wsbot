@@ -7,7 +7,7 @@ const qrcode = require('qrcode');
 
 module.exports = function startWebServer(options) {
 
-    const { getQr, getDebug, getLogs } = options;
+    const { getQr, getDebug, getLogs, getRestart } = options;
 
     const app = express();
 
@@ -85,7 +85,7 @@ module.exports = function startWebServer(options) {
     });
 
     // ===============================
-    // RESTART (reinicio total -> Render crea instancia nueva -> re-escaneo)
+    // RESTART (reinicio en-proceso: borra sesión y re-escanea, sin matar la instancia)
     // ===============================
 
     app.all('/restart', (req, res) => {
@@ -99,13 +99,17 @@ module.exports = function startWebServer(options) {
             return res.status(403).send('No autorizado');
         }
 
-        console.log('♻️ Reinicio total solicitado');
+        console.log('♻️ Reinicio en-proceso solicitado');
 
         res.status(202).send(
             'Reiniciando bot. Re-escanea el QR en /qr'
         );
 
-        setTimeout(() => process.exit(0), 300);
+        if (typeof getRestart === 'function') {
+            getRestart().catch((err) => {
+                console.error('Error en restart:', err);
+            });
+        }
     });
 
     // ===============================
