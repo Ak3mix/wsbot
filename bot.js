@@ -501,6 +501,8 @@ let reconnectAttempt = 0;
 
 let reconnectTimer = null;
 
+let bootConnectedNotified = false;
+
 const start = async () => {
 
     const { state, saveCreds } =
@@ -602,6 +604,19 @@ const start = async () => {
                 '\n📱 QR generado. Escanea en /qr (con QR_TOKEN)\n'
             );
 
+            // Sesión pendiente de escanear: avisar al móvil
+            // (1ª vez inmediato, luego cada 5h)
+            if (!currentRegistered) {
+
+                notifyCooldown(
+                    'session',
+                    QR_NOTIFY_INTERVAL,
+                    '📱 Bot sin escanear',
+                    'Escanea el QR en /qr para vincular WhatsApp.',
+                    { priority: 'high', tags: 'warning' }
+                );
+            }
+
             return;
         }
 
@@ -616,6 +631,18 @@ const start = async () => {
             notifyReset('session');
 
             notifyReset('reconnect');
+
+            // Aviso único de conexión por boot/restart
+            if (!bootConnectedNotified) {
+
+                bootConnectedNotified = true;
+
+                notify(
+                    '✅ Bot conectado',
+                    'El bot se conectó a WhatsApp.',
+                    { tags: 'white_check_mark' }
+                );
+            }
 
             console.log(
                 '\n✅ BOT CONECTADO\n'
@@ -1074,6 +1101,9 @@ const restartBot = async () => {
 
 const boot = async () => {
 
+    // Cada boot/restart vuelve a avisar cuando conecte (1 sola vez)
+    bootConnectedNotified = false;
+
     try {
 
         sockRef = await start();
@@ -1097,5 +1127,11 @@ startWebServer({
     getLogs,
     getRestart: restartBot
 });
+
+// Aviso de arranque del servicio (1 sola vez por proceso)
+notify(
+    '🔌 Servicio iniciado',
+    'El bot se levantó en Render.'
+);
 
 boot();
