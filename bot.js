@@ -127,12 +127,8 @@ const NOTIFY_REPLY = toBool(process.env.NOTIFY_REPLY ?? 'false');
 // Recordatorio de QR sin escanear: 1ª vez inmediato, luego cada 5h
 const QR_NOTIFY_INTERVAL = 5 * 60 * 60 * 1000;
 
-// Reconexión: avisar tras 5 fallos seguidos, luego 1 vez por hora
-const RECONNECT_NOTIFY_AFTER = 5;
-
-const RECONNECT_NOTIFY_INTERVAL = 60 * 60 * 1000;
-
-let reconnectFailCount = 0;
+// Sesión cerrada (logout) de una cuenta vinculada: 1 vez por hora
+const LOGOUT_NOTIFY_INTERVAL = 60 * 60 * 1000;
 
 const lastNotifyAt = {};
 
@@ -549,10 +545,33 @@ let reconnectTimer = null;
 
 let bootConnectedNotified = false;
 
+// true desde que hay (o hubo) una cuenta vinculada conectada
+let wasConnected = false;
+
+// "Servicio iniciado" se manda 1 sola vez por proceso (si hay cuenta)
+let startupNotified = false;
+
 const start = async () => {
 
     const { state, saveCreds } =
         await useMultiFileAuthState(SESSION_PATH);
+
+    // Si hay una sesión ya vinculada al arrancar, hay "cuenta".
+    // "Servicio iniciado" se manda 1 sola vez por proceso.
+    if (!startupNotified) {
+
+        startupNotified = true;
+
+        if (state.creds.registered === true) {
+
+            wasConnected = true;
+
+            notify(
+                '🔌 Servicio iniciado',
+                'El bot se levantó con la cuenta vinculada.'
+            );
+        }
+    }
 
     const { version } =
         await fetchLatestBaileysVersion();
@@ -672,11 +691,9 @@ const start = async () => {
 
             reconnectAttempt = 0;
 
-            reconnectFailCount = 0;
+            wasConnected = true;
 
             notifyReset('session');
-
-            notifyReset('reconnect');
 
             // Aviso único de conexión por boot/restart
             if (!bootConnectedNotified) {
@@ -684,8 +701,8 @@ const start = async () => {
                 bootConnectedNotified = true;
 
                 notify(
-                    '✅ Bot conectado',
-                    'El bot se conectó a WhatsApp.',
+                    '✅ Cuenta conectada correctamente',
+                    'El bot se vinculó a WhatsApp.',
                     { tags: 'white_check_mark' }
                 );
             }
@@ -762,31 +779,15 @@ const start = async () => {
 
             if (reconnecting) return;
 
-            // Notificación de sesión/QR (1ª vez inmediato, luego cada 5h)
-            if (!currentRegistered || isLoggedOut) {
+            // Solo avisar si una cuenta YA vinculada se cerró (logout)
+            if (isLoggedOut && wasConnected) {
 
                 notifyCooldown(
-                    'session',
-                    QR_NOTIFY_INTERVAL,
-                    !currentRegistered
-                        ? '🚨 Bot sin escanear'
-                        : '🚨 Sesión cerrada (logout)',
-                    'Re-escanea el QR en /qr cuando quieras.',
-                    { priority: 'high', tags: 'warning' }
-                );
-            }
-
-            // Reconexión fallando: tras N fallos, luego 1 vez por hora
-            reconnectFailCount += 1;
-
-            if (reconnectFailCount >= RECONNECT_NOTIFY_AFTER) {
-
-                notifyCooldown(
-                    'reconnect',
-                    RECONNECT_NOTIFY_INTERVAL,
-                    '⚠️ Reconexión fallando',
-                    `${reconnectFailCount} intentos de reconexión sin éxito.`,
-                    { tags: 'warning' }
+                    'logout',
+                    LOGOUT_NOTIFY_INTERVAL,
+                    '🚨 Sesión cerrada (logout)',
+                    'La cuenta vinculada se cerró. Re-escanea el QR en /qr.',
+                    { priority: 'high', tags: 'rotating_light' }
                 );
             }
 
@@ -1060,10 +1061,13 @@ const shutdown = async () => {
 
     console.log('\n🛑 Deteniendo bot...');
 
-    notify(
-        '🛑 Bot detenido',
-        'El proceso se detuvo (SIGTERM/SIGINT): hibernación, deploy o reinicio de Render.'
-    );
+    // Solo avisar si había una cuenta vinculada real (sino: ruido de QR)
+    if (wasConnected) {
+        notify(
+            '🛑 Bot detenido',
+            'El proceso se detuvo (SIGTERM/SIGINT): hibernación, deploy o reinicio de Render.'
+        );
+    }
 
     if (sockRef) {
         try {
@@ -1129,12 +1133,12 @@ const restartBot = async () => {
 
     latestQr = null;
     reconnectAttempt = 0;
-    reconnectFailCount = 0;
+    wasConnected = false;
     lidPns.clear();
     groupLidCache.clear();
     groupNames.clear();
     notifyReset('session');
-    notifyReset('reconnect');
+    notifyReset('logout');
 
     reconnecting = false;
 
@@ -1177,12 +1181,6 @@ startWebServer({
 // Diagnóstico de arranque: ¿hay URL de notificaciones configurada?
 console.log(
     `[notify] URL configurado: ${normalizedNotifyUrl() ? 'SÍ' : 'NO'}`
-);
-
-// Aviso de arranque del servicio (1 sola vez por proceso)
-notify(
-    '🔌 Servicio iniciado',
-    'El bot se levantó en Render.'
 );
 
 boot();
