@@ -136,9 +136,30 @@ let reconnectFailCount = 0;
 
 const lastNotifyAt = {};
 
+// Normaliza la URL: tolera valores tipo '//ntfy.sh/...' (falta el https:)
+const normalizedNotifyUrl = () => {
+
+    if (!NOTIFY_URL) return '';
+
+    const u = String(NOTIFY_URL).trim();
+
+    if (/^https?:\/\//i.test(u)) return u;
+
+    return `https://${u.replace(/^\/+/, '')}`;
+};
+
 const notify = (title, body, opts = {}) => {
 
-    if (!NOTIFY_URL) return;
+    const url = normalizedNotifyUrl();
+
+    if (!url) {
+
+        if (DEBUG_MODE) {
+            console.log('[notify] sin NOTIFY_URL configurada, aviso omitido:', title);
+        }
+
+        return;
+    }
 
     const { priority = 'default', tags = '' } = opts;
 
@@ -146,17 +167,35 @@ const notify = (title, body, opts = {}) => {
 
     const timer = setTimeout(() => controller.abort(), 3000);
 
-    fetch(NOTIFY_URL, {
+    if (DEBUG_MODE) {
+        console.log(`[notify] enviando '${title}' -> ${url}`);
+    }
+
+    // Publicación JSON: los emojis van en el cuerpo (UTF-8). Mandarlos en
+    // headers 'Title' rompe el fetch de Node (ByteString >255).
+    fetch(url, {
         method: 'POST',
-        headers: {
-            Title: title,
-            Priority: priority,
-            Tags: tags
-        },
-        body,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            title,
+            message: body,
+            priority,
+            tags: tags ? [tags] : []
+        }),
         signal: controller.signal
     })
-        .catch(() => { /* sin red: ignorar */ })
+        .then((res) => {
+
+            if (DEBUG_MODE) {
+                console.log(`[notify] enviado '${title}' -> status ${res.status}`);
+            }
+        })
+        .catch((err) => {
+
+            if (DEBUG_MODE) {
+                console.log(`[notify] fetch falló para '${title}': ${err.message}`);
+            }
+        })
         .finally(() => clearTimeout(timer));
 };
 
@@ -165,7 +204,14 @@ const notifyCooldown = (key, intervalMs, title, body, opts) => {
 
     const last = lastNotifyAt[key] || 0;
 
-    if (Date.now() - last < intervalMs) return;
+    if (Date.now() - last < intervalMs) {
+
+        if (DEBUG_MODE) {
+            console.log(`[notify] cooldown activo para '${title}', omitido`);
+        }
+
+        return;
+    }
 
     lastNotifyAt[key] = Date.now();
 
@@ -1127,6 +1173,11 @@ startWebServer({
     getLogs,
     getRestart: restartBot
 });
+
+// Diagnóstico de arranque: ¿hay URL de notificaciones configurada?
+console.log(
+    `[notify] URL configurado: ${normalizedNotifyUrl() ? 'SÍ' : 'NO'}`
+);
 
 // Aviso de arranque del servicio (1 sola vez por proceso)
 notify(
