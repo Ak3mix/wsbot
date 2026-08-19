@@ -7,7 +7,7 @@ const qrcode = require('qrcode');
 
 module.exports = function startWebServer(options) {
 
-    const { getQr, getDebug, getLogs, getRestart } = options;
+    const { getQr, getDebug, getLogs, getRestart, getNotify } = options;
 
     const app = express();
 
@@ -85,6 +85,30 @@ module.exports = function startWebServer(options) {
     });
 
     // ===============================
+    // NOTIFY (push de prueba bajo demanda)
+    // ===============================
+
+    app.all('/notify', (req, res) => {
+
+        if (token && req.query.token !== token) {
+            return res.status(403).send('No autorizado');
+        }
+
+        const title =
+            req.query.title || '🧪 Prueba de notificación';
+
+        const message =
+            req.query.message ||
+            'Si ves esto, las notificaciones llegan correctamente.';
+
+        if (typeof getNotify === 'function') {
+            getNotify(title, message);
+        }
+
+        res.send('Enviado');
+    });
+
+    // ===============================
     // RESTART (reinicio en-proceso: borra sesión y re-escanea, sin matar la instancia)
     // ===============================
 
@@ -145,7 +169,7 @@ module.exports = function startWebServer(options) {
 
     app.listen(port, () => {
         console.log(
-            `🌐 Web server en puerto ${port} (/health, /qr, /debug, /logs, /restart)`
+            `🌐 Web server en puerto ${port} (/health, /qr, /debug, /logs, /restart, /notify)`
         );
     });
 };

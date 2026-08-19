@@ -144,6 +144,36 @@ const normalizedNotifyUrl = () => {
     return `https://${u.replace(/^\/+/, '')}`;
 };
 
+// Cola serializada: respeta el límite de ntfy (~1 msg/s por tema)
+const NOTIFY_MIN_GAP = 1200;
+
+const NOTIFY_MAX_ATTEMPTS = 3;
+
+let notifyChain = Promise.resolve();
+
+let lastNotifySentAt = 0;
+
+const notifySend = async (url, payload) => {
+
+    const controller = new AbortController();
+
+    const timer = setTimeout(() => controller.abort(), 8000);
+
+    try {
+
+        return await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            signal: controller.signal
+        });
+
+    } finally {
+
+        clearTimeout(timer);
+    }
+};
+
 const notify = (title, body, opts = {}) => {
 
     const url = normalizedNotifyUrl();
@@ -154,49 +184,93 @@ const notify = (title, body, opts = {}) => {
             console.log('[notify] sin NOTIFY_URL configurada, aviso omitido:', title);
         }
 
-        return;
+        return Promise.resolve(false);
     }
 
     const { priority = 'default', tags = '' } = opts;
 
-    const controller = new AbortController();
+    notifyChain = notifyChain.then(async () => {
 
-    const timer = setTimeout(() => controller.abort(), 3000);
+        // Respetar ~1 msg/s de ntfy (espacio entre envíos)
+        const gap = NOTIFY_MIN_GAP - (Date.now() - lastNotifySentAt);
 
-    if (DEBUG_MODE) {
-        console.log(`[notify] enviando '${title}' -> ${url}`);
-    }
+        if (gap > 0) await delay(gap, gap);
 
-    // Publicación JSON: los emojis van en el cuerpo (UTF-8). Mandarlos en
-    // headers 'Title' rompe el fetch de Node (ByteString >255).
-    fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            title,
-            message: body,
-            priority,
-            tags: tags ? [tags] : []
-        }),
-        signal: controller.signal
-    })
-        .then((res) => {
+        for (let attempt = 1; attempt <= NOTIFY_MAX_ATTEMPTS; attempt++) {
 
             if (DEBUG_MODE) {
-                console.log(`[notify] enviado '${title}' -> status ${res.status}`);
+                console.log(`[notify] enviando '${title}' (intento ${attempt}/${NOTIFY_MAX_ATTEMPTS}) -> ${url}`);
             }
-        })
-        .catch((err) => {
+
+            let res;
+
+            try {
+
+                res = await notifySend(url, {
+                    title,
+                    message: body,
+                    priority,
+                    tags: tags ? [tags] : []
+                });
+
+            } catch (err) {
+
+                if (DEBUG_MODE) {
+                    console.log(`[notify] fetch falló para '${title}': ${err.message}`);
+                }
+
+                if (attempt < NOTIFY_MAX_ATTEMPTS) {
+
+                    await delay(2000 * attempt, 2000 * attempt);
+
+                    continue;
+                }
+
+                return false;
+            }
+
+            lastNotifySentAt = Date.now();
+
+            if (res.status >= 200 && res.status < 300) {
+
+                if (DEBUG_MODE) {
+                    console.log(`[notify] enviado '${title}' -> status ${res.status}`);
+                }
+
+                return true;
+            }
+
+            // 429 o 5xx: reintentar con backoff
+            const retryAfter =
+                parseInt(res.headers.get('retry-after') || '', 10);
+
+            const backoff =
+                retryAfter > 0 ? retryAfter * 1000 : 2000 * attempt;
 
             if (DEBUG_MODE) {
-                console.log(`[notify] fetch falló para '${title}': ${err.message}`);
+                console.log(`[notify] '${title}' -> status ${res.status}, reintentando en ${Math.round(backoff / 1000)}s`);
             }
-        })
-        .finally(() => clearTimeout(timer));
+
+            if (attempt < NOTIFY_MAX_ATTEMPTS) {
+                await delay(backoff, backoff);
+            }
+        }
+
+        if (DEBUG_MODE) {
+            console.log(`[notify] '${title}' -> falló definitivamente (${NOTIFY_MAX_ATTEMPTS} intentos)`);
+        }
+
+        return false;
+    });
+
+    return notifyChain;
 };
 
-// Notifica respetando cooldown por clave (antispam)
-const notifyCooldown = (key, intervalMs, title, body, opts) => {
+// Notifica respetando cooldown por clave (antispam).
+// El cooldown SOLO se marca si el envío tuvo éxito (2xx).
+const pendingNotifyKeys = new Set();
+
+const notifyCooldown = async (key, intervalMs, title, body, opts) => {
 
     const last = lastNotifyAt[key] || 0;
 
@@ -209,9 +283,44 @@ const notifyCooldown = (key, intervalMs, title, body, opts) => {
         return;
     }
 
-    lastNotifyAt[key] = Date.now();
+    if (pendingNotifyKeys.has(key)) {
 
-    notify(title, body, opts);
+        if (DEBUG_MODE) {
+            console.log(`[notify] ya en curso '${title}', omitido`);
+        }
+
+        return;
+    }
+
+    pendingNotifyKeys.add(key);
+
+    try {
+
+        const ok = await notify(title, body, opts);
+
+        if (ok === true) {
+            lastNotifyAt[key] = Date.now();
+        }
+
+    } finally {
+
+        pendingNotifyKeys.delete(key);
+    }
+};
+
+// Espera a que la cola de notificaciones (incl. reintentos) termine
+const flushNotify = async (capMs) => {
+
+    const chain = notifyChain;
+
+    await Promise.race([
+        chain,
+        delay(capMs, capMs).then(() => {
+            if (DEBUG_MODE) {
+                console.log('[notify] flush por tiempo, saliendo');
+            }
+        })
+    ]);
 };
 
 const notifyReset = (key) => {
@@ -1077,8 +1186,8 @@ const shutdown = async () => {
         }
     }
 
-    // Dar tiempo a que salga el POST de notificación
-    await delay(1500, 1500);
+    // Esperar a que salgan las notificaciones (con reintentos)
+    await flushNotify(10000);
 
     process.exit(0);
 };
@@ -1175,7 +1284,9 @@ startWebServer({
     getQr,
     getDebug,
     getLogs,
-    getRestart: restartBot
+    getRestart: restartBot,
+    getNotify: (title, message) =>
+        notify(title, message, { tags: 'test_tube' })
 });
 
 // Diagnóstico de arranque: ¿hay URL de notificaciones configurada?
