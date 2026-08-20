@@ -8,6 +8,10 @@ const util = require('util');
 
 const fs = require('fs');
 
+const path = require('path');
+
+const QRCode = require('qrcode');
+
 const pino = require('pino');
 
 const {
@@ -116,36 +120,27 @@ const REPLY_DELAY_MAX = Math.max(
 );
 
 // ======================================
-// NOTIFICACIONES (ntfy, con antispam)
+// NOTIFICACIONES (Telegram push, con antispam)
 // ======================================
 
-const NOTIFY_URL = process.env.NOTIFY_URL || '';
+const telegram = require('./telegram');
+
+const { telegramApi, sendTelegramPhoto } = telegram;
+
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 
 // Avisar cuando el bot responde (solo nombre del grupo)
 const NOTIFY_REPLY = toBool(process.env.NOTIFY_REPLY ?? 'false');
-
-// Recordatorio de QR sin escanear: 1ª vez inmediato, luego cada 5h
-const QR_NOTIFY_INTERVAL = 5 * 60 * 60 * 1000;
 
 // Sesión cerrada (logout) de una cuenta vinculada: 1 vez por hora
 const LOGOUT_NOTIFY_INTERVAL = 60 * 60 * 1000;
 
 const lastNotifyAt = {};
 
-// Normaliza la URL: tolera valores tipo '//ntfy.sh/...' (falta el https:)
-const normalizedNotifyUrl = () => {
-
-    if (!NOTIFY_URL) return '';
-
-    const u = String(NOTIFY_URL).trim();
-
-    if (/^https?:\/\//i.test(u)) return u;
-
-    return `https://${u.replace(/^\/+/, '')}`;
-};
-
-// Cola serializada: el free tier de ntfy sostiene ~1 petición/10s por IP
-const NOTIFY_MIN_GAP = 11000;
+// Cola serializada: espacio entre envíos para no inundar el chat
+const NOTIFY_MIN_GAP = 2000;
 
 const NOTIFY_MAX_ATTEMPTS = 3;
 
@@ -153,58 +148,22 @@ let notifyChain = Promise.resolve();
 
 let lastNotifySentAt = 0;
 
-const notifySend = async (url, payload) => {
-
-    const controller = new AbortController();
-
-    const timer = setTimeout(() => controller.abort(), 8000);
-
-    try {
-
-        return await fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-            signal: controller.signal
-        });
-
-    } finally {
-
-        clearTimeout(timer);
-    }
-};
-
-// Lee el body de una respuesta (para loguear el motivo del 429)
-const responseBody = async (res) => {
-
-    try {
-
-        return (await res.text()).slice(0, 300);
-
-    } catch (e) {
-
-        return '';
-    }
-};
-
 const notify = (title, body, opts = {}) => {
 
-    const url = normalizedNotifyUrl();
-
-    if (!url) {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
 
         if (DEBUG_MODE) {
-            console.log('[notify] sin NOTIFY_URL configurada, aviso omitido:', title);
+            console.log('[notify] Telegram no configurado (faltan TOKEN/CHAT_ID), aviso omitido:', title);
         }
 
         return Promise.resolve(false);
     }
 
-    const { priority = 'default', tags = '' } = opts;
+    const text = body ? `${title}\n${body}` : title;
 
     notifyChain = notifyChain.then(async () => {
 
-        // Respetar ~1 petición/10s del free tier (espacio entre envíos)
+        // Respetar espacio entre envíos
         const gap = NOTIFY_MIN_GAP - (Date.now() - lastNotifySentAt);
 
         if (gap > 0) await delay(gap, gap);
@@ -212,74 +171,44 @@ const notify = (title, body, opts = {}) => {
         for (let attempt = 1; attempt <= NOTIFY_MAX_ATTEMPTS; attempt++) {
 
             if (DEBUG_MODE) {
-                console.log(`[notify] enviando '${title}' (intento ${attempt}/${NOTIFY_MAX_ATTEMPTS}) -> ${url}`);
+                console.log(`[notify] enviando '${title}' (intento ${attempt}/${NOTIFY_MAX_ATTEMPTS})`);
             }
-
-            let res;
 
             try {
 
-                res = await notifySend(url, {
-                    title,
-                    message: body,
-                    priority,
-                    tags: tags ? [tags] : []
+                await telegramApi('sendMessage', {
+                    chat_id: TELEGRAM_CHAT_ID,
+                    text
                 });
+
+                lastNotifySentAt = Date.now();
+
+                if (DEBUG_MODE) {
+                    console.log(`[notify] enviado '${title}'`);
+                }
+
+                return true;
 
             } catch (err) {
 
                 if (DEBUG_MODE) {
-                    console.log(`[notify] fetch falló para '${title}': ${err.message}`);
+                    console.log(`[notify] '${title}' -> ${err.message}`);
                 }
 
-                if (attempt < NOTIFY_MAX_ATTEMPTS) {
+                // Reintentar solo errores de red (sin status) o 5xx
+                const retriable = !err.status || err.status >= 500;
 
-                    await delay(5000 * attempt, 5000 * attempt);
+                if (retriable && attempt < NOTIFY_MAX_ATTEMPTS) {
+
+                    await delay(3000 * attempt, 3000 * attempt);
 
                     continue;
                 }
 
-                return false;
-            }
-
-            lastNotifySentAt = Date.now();
-
-            if (res.status >= 200 && res.status < 300) {
-
-                if (DEBUG_MODE) {
-                    console.log(`[notify] enviado '${title}' -> status ${res.status}`);
-                }
-
-                return true;
-            }
-
-            // 429 = cuota alcanzada (250/12h por IP en free tier).
-            // Reintentar es inútil y quema cuota: loguear motivo y parar.
-            if (res.status === 429) {
-
-                const details = await responseBody(res);
-
-                if (DEBUG_MODE) {
-                    console.log(`[notify] '${title}' -> 429 (sin reintento). Detalle: ${details || res.statusText}`);
-                }
+                lastNotifySentAt = Date.now();
 
                 return false;
             }
-
-            // 5xx: reintentar con backoff
-            const backoff = 5000 * attempt;
-
-            if (DEBUG_MODE) {
-                console.log(`[notify] '${title}' -> status ${res.status}, reintentando en ${Math.round(backoff / 1000)}s`);
-            }
-
-            if (attempt < NOTIFY_MAX_ATTEMPTS) {
-                await delay(backoff, backoff);
-            }
-        }
-
-        if (DEBUG_MODE) {
-            console.log(`[notify] '${title}' -> falló definitivamente (${NOTIFY_MAX_ATTEMPTS} intentos)`);
         }
 
         return false;
@@ -290,8 +219,7 @@ const notify = (title, body, opts = {}) => {
 
 // Notifica respetando cooldown por clave (antispam).
 // El cooldown se marca AL INTENTAR (no al lograr éxito): así el
-// recordatorio mantiene su cadencia (1ª vez + cada N) sin martillar
-// a ntfy cuando está limitado por cuota.
+// aviso mantiene su cadencia sin martillar a Telegram.
 const pendingNotifyKeys = new Set();
 
 const notifyCooldown = async (key, intervalMs, title, body, opts) => {
@@ -343,33 +271,6 @@ const flushNotify = async (capMs) => {
             }
         })
     ]);
-};
-
-// Log (DEBUG) de la cuota de mensajes restante de la IP actual
-const logNotifyQuota = async () => {
-
-    if (!NOTIFY_URL || !DEBUG_MODE) return;
-
-    try {
-
-        const res = await fetch('https://ntfy.sh/v1/account', {
-            method: 'GET',
-            signal: AbortSignal.timeout(8000)
-        });
-
-        if (!res.ok) return;
-
-        const j = await res.json();
-
-        const remaining = j?.stats?.messages_remaining;
-
-        if (typeof remaining === 'number') {
-            console.log(`[notify] cuota restante (IP actual): ${remaining}/${j?.limits?.messages ?? '?'}`);
-        }
-
-    } catch (e) {
-        // diagnóstico opcional: silencio
-    }
 };
 
 const notifyReset = (key) => {
@@ -709,6 +610,16 @@ let wasConnected = false;
 // "Servicio iniciado" se manda 1 sola vez por proceso (si hay cuenta)
 let startupNotified = false;
 
+// QR bajo demanda: chat al que enviar el QR + foto ya enviada
+let qrPhotoChatId = null;
+
+let qrPhotoSent = false;
+
+// Si en este tiempo no se escanea el QR, vuelve al modo espera
+const QR_IDLE_TIMEOUT = 3 * 60 * 1000;
+
+let qrIdleTimer = null;
+
 const start = async () => {
 
     const { state, saveCreds } =
@@ -823,21 +734,22 @@ const start = async () => {
                 );
             }
 
-            console.log(
-                '\n📱 QR generado. Escanea en /qr (con QR_TOKEN)\n'
-            );
+            // El QR solo se envía si lo pidieron vía Telegram (/qr)
+            if (qrPhotoChatId && !qrPhotoSent) {
 
-            // Sesión pendiente de escanear: avisar al móvil
-            // (1ª vez inmediato, luego cada 5h)
-            if (!currentRegistered) {
+                qrPhotoSent = true;
 
-                notifyCooldown(
-                    'session',
-                    QR_NOTIFY_INTERVAL,
-                    '📱 Bot sin escanear',
-                    'Escanea el QR en /qr para vincular WhatsApp.',
-                    { priority: 'high', tags: 'warning' }
-                );
+                QRCode.toBuffer(qr, { width: 512, margin: 1 })
+                    .then((buf) =>
+                        sendTelegramPhoto(
+                            qrPhotoChatId,
+                            buf,
+                            '📱 Escanea este QR con WhatsApp para vincular.'
+                        )
+                    )
+                    .catch((err) => {
+                        console.log('[qr] no pude enviar la foto:', err.message);
+                    });
             }
 
             return;
@@ -851,7 +763,14 @@ const start = async () => {
 
             wasConnected = true;
 
-            notifyReset('session');
+            qrPhotoChatId = null;
+
+            qrPhotoSent = false;
+
+            if (qrIdleTimer) {
+                clearTimeout(qrIdleTimer);
+                qrIdleTimer = null;
+            }
 
             // Aviso único de conexión por boot/restart
             if (!bootConnectedNotified) {
@@ -860,8 +779,7 @@ const start = async () => {
 
                 notify(
                     '✅ Cuenta conectada correctamente',
-                    'El bot se vinculó a WhatsApp.',
-                    { tags: 'white_check_mark' }
+                    'El bot se vinculó a WhatsApp.'
                 );
             }
 
@@ -1245,25 +1163,37 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 // ======================================
-// REINICIO EN-PROCESO (sin matar la instancia)
+// DESCONEXIÓN / QR BAJO DEMANDA
 // ======================================
 
-const restartBot = async () => {
+// Detiene Baileys, borra la sesión y vuelve al "modo espera"
+// (sin reiniciar Baileys: el QR solo se genera con /qr).
+const disconnectBot = async () => {
 
-    console.log('\n♻️ Reiniciando bot (sesión nueva)...\n');
+    console.log('\n🚪 Desconectando bot (sesión nueva)...\n');
 
-    notify(
-        '♻️ Reinicio solicitado',
-        'El bot se reinició y la sesión se borró. Re-escanea el QR en /qr cuando quieras.'
-    );
+    if (wasConnected) {
+        notify(
+            '🚪 Sesión borrada',
+            'El bot quedó desconectado. Usa /qr para vincular una sesión nueva.'
+        );
+    }
 
     reconnecting = true;
 
-    // Cancelar cualquier reconexión pendiente: /restart gana siempre
+    // Cancelar cualquier reconexión pendiente
     if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
     }
+
+    if (qrIdleTimer) {
+        clearTimeout(qrIdleTimer);
+        qrIdleTimer = null;
+    }
+
+    qrPhotoChatId = null;
+    qrPhotoSent = false;
 
     if (sockRef) {
         try {
@@ -1282,35 +1212,157 @@ const restartBot = async () => {
 
         fs.rmSync(SESSION_PATH, { recursive: true, force: true });
 
-        console.log('[restart] sesión eliminada:', SESSION_PATH);
+        console.log('[disconnect] sesión eliminada:', SESSION_PATH);
 
     } catch (e) {
 
-        console.log('[restart] no se pudo borrar la sesión:', e.message);
+        console.log('[disconnect] no se pudo borrar la sesión:', e.message);
     }
 
     latestQr = null;
     reconnectAttempt = 0;
     wasConnected = false;
+    currentRegistered = false;
     lidPns.clear();
     groupLidCache.clear();
     groupNames.clear();
-    notifyReset('session');
     notifyReset('logout');
 
     reconnecting = false;
 
-    await boot();
+    console.log(
+        '\n[modo espera] sin sesión. Usa /qr en Telegram para generar un QR nuevo.\n'
+    );
+};
+
+// Si el QR no se escanea en QR_IDLE_TIMEOUT, corta Baileys y vuelve
+// al modo espera (evita "pedir QR" sin parar).
+const armQrIdleTimeout = () => {
+
+    if (qrIdleTimer) {
+        clearTimeout(qrIdleTimer);
+    }
+
+    qrIdleTimer = setTimeout(async () => {
+
+        qrIdleTimer = null;
+
+        if (sockRef && !wasConnected) {
+
+            console.log('[qr] no se escaneó en 3 min, volviendo al modo espera');
+
+            reconnecting = true;
+
+            if (reconnectTimer) {
+                clearTimeout(reconnectTimer);
+                reconnectTimer = null;
+            }
+
+            try {
+                await sockRef.end();
+            } catch (e) {
+                // ignorar
+            }
+
+            sockRef = null;
+            reconnectAttempt = 0;
+            reconnecting = false;
+            qrPhotoChatId = null;
+            qrPhotoSent = false;
+
+            console.log(
+                '\n[modo espera] sin sesión. Usa /qr en Telegram para generar un QR nuevo.\n'
+            );
+        }
+
+    }, QR_IDLE_TIMEOUT);
+};
+
+// Arranca Baileys bajo demanda para generar un QR (llamado por /qr).
+const startQrSession = async (chatId) => {
+
+    if (qrIdleTimer) {
+        clearTimeout(qrIdleTimer);
+        qrIdleTimer = null;
+    }
+
+    qrPhotoChatId = chatId || null;
+    qrPhotoSent = false;
+
+    // Si ya hay Baileys corriendo (p. ej. reconectando), el QR
+    // pendiente llegará por el evento y se enviará a qrPhotoChatId.
+    if (sockRef) {
+
+        armQrIdleTimeout();
+
+        return;
+    }
+
+    try {
+
+        sockRef = await start();
+
+    } catch (err) {
+
+        console.log('\n❌ ERROR AL INICIAR PARA QR\n');
+
+        console.log(err);
+
+        if (qrPhotoChatId) {
+
+            telegramApi('sendMessage', {
+                chat_id: qrPhotoChatId,
+                text: '❌ No pude iniciar Baileys para generar el QR. Revisa los logs.'
+            }).catch(() => {});
+
+            qrPhotoChatId = null;
+        }
+
+        return;
+    }
+
+    armQrIdleTimeout();
 };
 
 // ======================================
 // START
 // ======================================
 
+// true si hay credenciales vinculadas en disco (sesión ya escaneada)
+const sessionRegisteredOnDisk = () => {
+
+    try {
+
+        const p = path.join(SESSION_PATH, 'creds.json');
+
+        if (!fs.existsSync(p)) return false;
+
+        const creds = JSON.parse(fs.readFileSync(p, 'utf8'));
+
+        return creds.registered === true || (creds.me && creds.me.id);
+
+    } catch (e) {
+
+        return false;
+    }
+};
+
 const boot = async () => {
 
     // Cada boot/restart vuelve a avisar cuando conecte (1 sola vez)
     bootConnectedNotified = false;
+
+    // ARRANQUE PEREEZOSO: sin sesión vinculada NO se inicia Baileys.
+    // El bot queda en "modo espera" y el QR solo se genera con /qr.
+    if (!sessionRegisteredOnDisk()) {
+
+        console.log(
+            '\n[modo espera] sin sesión vinculada. Baileys NO iniciado.\n' +
+            'Usa /qr en Telegram (o el endpoint /qr) cuando quieras generar un QR.\n'
+        );
+
+        return;
+    }
 
     try {
 
@@ -1333,17 +1385,21 @@ startWebServer({
     getQr,
     getDebug,
     getLogs,
-    getRestart: restartBot,
+    getRestart: disconnectBot,
     getNotify: (title, message) =>
-        notify(title, message, { tags: 'test_tube' })
+        notify(title, message)
 });
 
-// Diagnóstico de arranque: ¿hay URL de notificaciones configurada?
-console.log(
-    `[notify] URL configurado: ${normalizedNotifyUrl() ? 'SÍ' : 'NO'}`
-);
+telegram({
+    getQr,
+    getDebug,
+    getLogs,
+    startQrSession,
+    disconnectBot
+});
 
-// Cuota restante de la IP (solo DEBUG_MODE)
-logNotifyQuota();
+console.log(
+    `[telegram] bot configurado: ${TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? 'SÍ' : 'NO'}`
+);
 
 boot();

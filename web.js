@@ -109,7 +109,7 @@ module.exports = function startWebServer(options) {
     });
 
     // ===============================
-    // RESTART (reinicio en-proceso: borra sesión y re-escanea, sin matar la instancia)
+    // RESTART (desconecta y borra sesión: vuelve al modo espera)
     // ===============================
 
     app.all('/restart', (req, res) => {
@@ -123,15 +123,15 @@ module.exports = function startWebServer(options) {
             return res.status(403).send('No autorizado');
         }
 
-        console.log('♻️ Reinicio en-proceso solicitado');
+        console.log('🚪 Desconexión en-proceso solicitada');
 
         res.status(202).send(
-            'Reiniciando bot. Re-escanea el QR en /qr'
+            'Desconectando bot. Usa /qr para generar un QR nuevo'
         );
 
         if (typeof getRestart === 'function') {
             getRestart().catch((err) => {
-                console.error('Error en restart:', err);
+                console.error('Error en desconexión:', err);
             });
         }
     });

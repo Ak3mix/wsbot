@@ -25,7 +25,11 @@ services:
         sync: false
       - key: REPLY_DELAY_MAX
         sync: false
-      - key: NOTIFY_URL
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: TELEGRAM_ALLOWED_IDS
         sync: false
       - key: NOTIFY_REPLY
         sync: false
