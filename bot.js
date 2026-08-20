@@ -144,8 +144,8 @@ const normalizedNotifyUrl = () => {
     return `https://${u.replace(/^\/+/, '')}`;
 };
 
-// Cola serializada: respeta el límite de ntfy (~1 msg/s por tema)
-const NOTIFY_MIN_GAP = 1200;
+// Cola serializada: el free tier de ntfy sostiene ~1 petición/10s por IP
+const NOTIFY_MIN_GAP = 11000;
 
 const NOTIFY_MAX_ATTEMPTS = 3;
 
@@ -174,6 +174,19 @@ const notifySend = async (url, payload) => {
     }
 };
 
+// Lee el body de una respuesta (para loguear el motivo del 429)
+const responseBody = async (res) => {
+
+    try {
+
+        return (await res.text()).slice(0, 300);
+
+    } catch (e) {
+
+        return '';
+    }
+};
+
 const notify = (title, body, opts = {}) => {
 
     const url = normalizedNotifyUrl();
@@ -191,7 +204,7 @@ const notify = (title, body, opts = {}) => {
 
     notifyChain = notifyChain.then(async () => {
 
-        // Respetar ~1 msg/s de ntfy (espacio entre envíos)
+        // Respetar ~1 petición/10s del free tier (espacio entre envíos)
         const gap = NOTIFY_MIN_GAP - (Date.now() - lastNotifySentAt);
 
         if (gap > 0) await delay(gap, gap);
@@ -221,7 +234,7 @@ const notify = (title, body, opts = {}) => {
 
                 if (attempt < NOTIFY_MAX_ATTEMPTS) {
 
-                    await delay(2000 * attempt, 2000 * attempt);
+                    await delay(5000 * attempt, 5000 * attempt);
 
                     continue;
                 }
@@ -240,12 +253,21 @@ const notify = (title, body, opts = {}) => {
                 return true;
             }
 
-            // 429 o 5xx: reintentar con backoff
-            const retryAfter =
-                parseInt(res.headers.get('retry-after') || '', 10);
+            // 429 = cuota alcanzada (250/12h por IP en free tier).
+            // Reintentar es inútil y quema cuota: loguear motivo y parar.
+            if (res.status === 429) {
 
-            const backoff =
-                retryAfter > 0 ? retryAfter * 1000 : 2000 * attempt;
+                const details = await responseBody(res);
+
+                if (DEBUG_MODE) {
+                    console.log(`[notify] '${title}' -> 429 (sin reintento). Detalle: ${details || res.statusText}`);
+                }
+
+                return false;
+            }
+
+            // 5xx: reintentar con backoff
+            const backoff = 5000 * attempt;
 
             if (DEBUG_MODE) {
                 console.log(`[notify] '${title}' -> status ${res.status}, reintentando en ${Math.round(backoff / 1000)}s`);
@@ -267,7 +289,9 @@ const notify = (title, body, opts = {}) => {
 };
 
 // Notifica respetando cooldown por clave (antispam).
-// El cooldown SOLO se marca si el envío tuvo éxito (2xx).
+// El cooldown se marca AL INTENTAR (no al lograr éxito): así el
+// recordatorio mantiene su cadencia (1ª vez + cada N) sin martillar
+// a ntfy cuando está limitado por cuota.
 const pendingNotifyKeys = new Set();
 
 const notifyCooldown = async (key, intervalMs, title, body, opts) => {
@@ -296,11 +320,9 @@ const notifyCooldown = async (key, intervalMs, title, body, opts) => {
 
     try {
 
-        const ok = await notify(title, body, opts);
+        lastNotifyAt[key] = Date.now();
 
-        if (ok === true) {
-            lastNotifyAt[key] = Date.now();
-        }
+        await notify(title, body, opts);
 
     } finally {
 
@@ -321,6 +343,33 @@ const flushNotify = async (capMs) => {
             }
         })
     ]);
+};
+
+// Log (DEBUG) de la cuota de mensajes restante de la IP actual
+const logNotifyQuota = async () => {
+
+    if (!NOTIFY_URL || !DEBUG_MODE) return;
+
+    try {
+
+        const res = await fetch('https://ntfy.sh/v1/account', {
+            method: 'GET',
+            signal: AbortSignal.timeout(8000)
+        });
+
+        if (!res.ok) return;
+
+        const j = await res.json();
+
+        const remaining = j?.stats?.messages_remaining;
+
+        if (typeof remaining === 'number') {
+            console.log(`[notify] cuota restante (IP actual): ${remaining}/${j?.limits?.messages ?? '?'}`);
+        }
+
+    } catch (e) {
+        // diagnóstico opcional: silencio
+    }
 };
 
 const notifyReset = (key) => {
@@ -1187,7 +1236,7 @@ const shutdown = async () => {
     }
 
     // Esperar a que salgan las notificaciones (con reintentos)
-    await flushNotify(10000);
+    await flushNotify(15000);
 
     process.exit(0);
 };
@@ -1293,5 +1342,8 @@ startWebServer({
 console.log(
     `[notify] URL configurado: ${normalizedNotifyUrl() ? 'SÍ' : 'NO'}`
 );
+
+// Cuota restante de la IP (solo DEBUG_MODE)
+logNotifyQuota();
 
 boot();
