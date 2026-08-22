@@ -763,16 +763,38 @@ const start = async () => {
 
             wasConnected = true;
 
-            // Pre-calentar el mapa LID->PN en background para los
-            // grupos autorizados: asi el primer mensaje tras un
-            // reinicio/despertar no paga la peticion de red.
+            // Pre-calentar el mapa LID->PN de los grupos autorizados,
+            // uno a uno con pausa de 200ms (para no meter 50+ peticiones
+            // de golpe a WhatsApp). Corre en background: el bot responde
+            // desde ya; tarda ~25s en cubrir todos los grupos.
             if (ALLOWED_GROUPS.length > 0) {
-                for (const gid of ALLOWED_GROUPS) {
-                    ensureGroupLidMap(sock, gid);
-                }
+
                 console.log(
-                    '[lid] pre-calentando mapa para ' + ALLOWED_GROUPS.length + ' grupo(s)'
+                    '[lid] pre-calentando mapa de ' + ALLOWED_GROUPS.length + ' grupo(s)...'
                 );
+
+                (async () => {
+
+                    let done = 0;
+
+                    for (const gid of ALLOWED_GROUPS) {
+
+                        // Si el socket cambió a mitad (reconexión), abortar:
+                        // el nuevo 'open' ya lanza su propio pre-calentamiento.
+                        if (sockRef && sockRef !== sock) break;
+
+                        await ensureGroupLidMap(sock, gid);
+
+                        done += 1;
+
+                        await delay(200, 200);
+                    }
+
+                    console.log(
+                        '[lid] pre-calentamiento: ' + done + '/' + ALLOWED_GROUPS.length + ' grupo(s)'
+                    );
+
+                })();
             }
 
             qrPhotoChatId = null;
