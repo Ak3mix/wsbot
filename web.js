@@ -7,7 +7,7 @@ const qrcode = require('qrcode');
 
 module.exports = function startWebServer(options) {
 
-    const { getQr, getDebug, getLogs, getRestart, getNotify } = options;
+    const { getQr, getDebug, getLogs, getStartQrSession, getRestart, getNotify } = options;
 
     const app = express();
 
@@ -61,6 +61,36 @@ module.exports = function startWebServer(options) {
 </body>
 </html>`
         );
+    });
+
+    // ===============================
+    // QR-REMOTE (disparo manual desde el líder)
+    // ===============================
+
+    app.all('/qr-remote', async (req, res) => {
+
+        if (token && req.query.token !== token) {
+            return res.status(403).send('No autorizado');
+        }
+
+        const chatId = req.query.chat_id;
+
+        if (!chatId) {
+            return res.status(400).send('Falta chat_id');
+        }
+
+        const debug = typeof getDebug === 'function' ? getDebug() : {};
+
+        if (debug.connected) {
+            return res.send('connected');
+        }
+
+        if (typeof getStartQrSession === 'function') {
+            await getStartQrSession(chatId);
+            return res.status(202).send('QR solicitado');
+        }
+
+        res.status(500).send('No disponible');
     });
 
     // ===============================
@@ -169,7 +199,7 @@ module.exports = function startWebServer(options) {
 
     app.listen(port, () => {
         console.log(
-            `🌐 Web server en puerto ${port} (/health, /qr, /debug, /logs, /restart, /notify)`
+            `🌐 Web server en puerto ${port} (/health, /qr, /qr-remote, /debug, /logs, /restart, /notify)`
         );
     });
 };

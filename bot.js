@@ -105,6 +105,9 @@ const splitCsv = (value) =>
 // los marcadores de una línea siempre se muestran.
 const DEBUG_MODE = toBool(process.env.DEBUG_MODE ?? 'false');
 
+const BOT_ROLE = (process.env.BOT_ROLE || 'trabajo').toLowerCase().trim();
+const ROLE_LABEL = BOT_ROLE.charAt(0).toUpperCase() + BOT_ROLE.slice(1);
+
 // ======================================
 // DELAY DE RESPUESTA (ms). 0 = instantáneo
 // ======================================
@@ -159,7 +162,7 @@ const notify = (title, body, opts = {}) => {
         return Promise.resolve(false);
     }
 
-    const text = body ? `${title}\n${body}` : title;
+    const text = body ? `[${ROLE_LABEL}] ${title}\n${body}` : `[${ROLE_LABEL}] ${title}`;
 
     notifyChain = notifyChain.then(async () => {
 
@@ -584,6 +587,12 @@ const getDebug = () => ({
     sessionPath: SESSION_PATH,
 
     debugMode: DEBUG_MODE,
+
+        role: BOT_ROLE,
+
+        role: BOT_ROLE,
+
+        role: BOT_ROLE,
 
     node:
 
@@ -1420,6 +1429,7 @@ startWebServer({
     getQr,
     getDebug,
     getLogs,
+    getStartQrSession: startQrSession,
     getRestart: disconnectBot,
     getNotify: (title, message) =>
         notify(title, message)

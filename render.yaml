@@ -33,3 +33,13 @@ services:
         sync: false
       - key: NOTIFY_REPLY
         sync: false
+      - key: BOT_ROLE
+        sync: false
+      - key: TELEGRAM_POLL
+        sync: false
+      - key: PEER_URL
+        sync: false
+      - key: PEER_ROLE
+        sync: false
+      - key: PEER_TOKEN
+        sync: false
