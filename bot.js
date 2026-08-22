@@ -763,6 +763,18 @@ const start = async () => {
 
             wasConnected = true;
 
+            // Pre-calentar el mapa LID->PN en background para los
+            // grupos autorizados: asi el primer mensaje tras un
+            // reinicio/despertar no paga la peticion de red.
+            if (ALLOWED_GROUPS.length > 0) {
+                for (const gid of ALLOWED_GROUPS) {
+                    ensureGroupLidMap(sock, gid);
+                }
+                console.log(
+                    '[lid] pre-calentando mapa para ' + ALLOWED_GROUPS.length + ' grupo(s)'
+                );
+            }
+
             qrPhotoChatId = null;
 
             qrPhotoSent = false;
@@ -992,15 +1004,31 @@ const start = async () => {
             );
 
             // ===============================
+            // PALABRAS CLAVE (primero: descarta la mayoría sin tocar LID)
+            // ===============================
+
+            const detected =
+                KEYWORDS.some(word =>
+                    text.includes(word)
+                );
+
+            if (!detected) return;
+
+            console.log(
+                '🚨 Keyword detectada'
+            );
+
+            // ===============================
             // FILTRO DE USUARIOS
             // ===============================
 
-            // Resolver LID -> número solo si el remitente es @lid y
-            // todavía no conocemos su número real (fuera de la ruta caliente)
+            // Resolver LID -> número en background (sin await): el primer
+            // mensaje de un remitente nuevo puede no autorizarse, pero el
+            // mapa se llena solo y los siguientes son instantáneos.
             const lid = senderId.toLowerCase().trim();
 
             if (lid.endsWith('@lid') && !lidPns.has(lid)) {
-                await ensureGroupLidMap(sock, groupId);
+                ensureGroupLidMap(sock, groupId);
             }
 
             // Vacío = TODOS los usuarios
@@ -1040,21 +1068,6 @@ const start = async () => {
                     );
                 }
             }
-
-            // ===============================
-            // PALABRAS CLAVE
-            // ===============================
-
-            const detected =
-                KEYWORDS.some(word =>
-                    text.includes(word)
-                );
-
-            if (!detected) return;
-
-            console.log(
-                '🚨 Keyword detectada'
-            );
 
             // ===============================
             // DELAY DE RESPUESTA (0 por defecto = instantáneo)
